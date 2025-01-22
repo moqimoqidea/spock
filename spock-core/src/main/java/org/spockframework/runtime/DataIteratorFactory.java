@@ -7,6 +7,7 @@ import java.io.StringWriter;
 import java.util.*;
 
 import org.jetbrains.annotations.NotNull;
+import org.spockframework.util.Assert;
 import org.spockframework.util.Nullable;
 import spock.config.RunnerConfiguration;
 
@@ -28,7 +29,9 @@ public class DataIteratorFactory {
     if (context.getCurrentFeature().getDataProcessorMethod() == null) {
       return new SingleEmptyIterationDataIterator();
     }
-    return new DataProcessorIterator(supervisor, context, new FeatureDataProviderIterator(supervisor, context));
+    return new IterationFilterIterator(supervisor, context,
+      new DataProcessorIterator(supervisor, context,
+        new FeatureDataProviderIterator(supervisor, context)));
   }
 
   private abstract static class BaseDataIterator implements IDataIterator {
@@ -200,6 +203,88 @@ public class DataIteratorFactory {
     }
   }
 
+  private static class IterationFilterIterator extends BaseDataIterator {
+    private final IDataIterator delegate;
+    private final List<String> dataVariableNames;
+    private final boolean logFilteredIterations;
+    private IStackTraceFilter stackTraceFilter;
+
+    private IterationFilterIterator(IRunSupervisor supervisor, SpockExecutionContext context, IDataIterator delegate) {
+      super(supervisor, context);
+      this.delegate = delegate;
+      dataVariableNames = delegate.getDataVariableNames();
+
+      RunnerConfiguration runnerConfiguration = context
+        .getRunContext()
+        .getConfiguration(RunnerConfiguration.class);
+      logFilteredIterations = runnerConfiguration.logFilteredIterations;
+      if (logFilteredIterations) {
+        stackTraceFilter = runnerConfiguration.filterStackTrace ? new StackTraceFilter(context.getSpec()) : new DummyStackTraceFilter();
+      }
+    }
+
+    @Override
+    public int getEstimatedNumIterations() {
+      return delegate.getEstimatedNumIterations();
+    }
+
+    @Override
+    public List<String> getDataVariableNames() {
+      return dataVariableNames;
+    }
+
+    @Override
+    public void close() throws Exception {
+      delegate.close();
+    }
+
+    @Override
+    public boolean hasNext() {
+      return delegate.hasNext();
+    }
+
+    @Override
+    public Object[] next() {
+      while (true) {
+        Object[] next = delegate.next();
+
+        // delegate.next() will return null if an error occurred
+        if (next == null) {
+          return null;
+        }
+
+        MethodInfo filterMethod = context.getCurrentFeature().getFilterMethod();
+        if (filterMethod == null) {
+          return next;
+        }
+
+        try {
+          // do not use invokeRaw here, as that would report Assertion Error to the supervisor
+          filterMethod.invoke(context.getSharedInstance(), next);
+          return next;
+        } catch (AssertionError ae) {
+          if (logFilteredIterations) {
+            StringJoiner stringJoiner = new StringJoiner(", ", "Filtered iteration [", "]:\n");
+            for (int i = 0; i < dataVariableNames.size(); i++) {
+              stringJoiner.add(dataVariableNames.get(i) + ": " + next[i]);
+            }
+            StringWriter sw = new StringWriter();
+            sw.write(stringJoiner.toString());
+            stackTraceFilter.filter(ae);
+            try (PrintWriter pw = new PrintWriter(sw)) {
+              ae.printStackTrace(pw);
+            }
+            System.err.println(sw);
+          }
+          // filter block does not like these values, try next ones if available
+        } catch (Throwable t) {
+          supervisor.error(context.getErrorInfoCollector(), new ErrorInfo(filterMethod, t, getErrorContext()));
+          return null;
+        }
+      }
+    }
+  }
+
   private static class DataProcessorIterator extends BaseDataIterator {
     private final IDataIterator delegate;
     private final List<String> dataVariableNames;
@@ -261,8 +346,6 @@ public class DataIteratorFactory {
     private final int estimatedNumIterations;
     private final List<String> dataVariableNames;
     private boolean firstIteration = true;
-    private boolean logFilteredIterations = true;
-    private IStackTraceFilter stackTraceFilter;
 
     public FeatureDataProviderIterator(IRunSupervisor supervisor, SpockExecutionContext context) {
       super(supervisor, context);
@@ -271,14 +354,6 @@ public class DataIteratorFactory {
       dataProviders = createDataProviders();
       dataProviderIterators = createDataProviderIterators();
       estimatedNumIterations = estimateNumIterations(dataProviderIterators);
-
-      RunnerConfiguration runnerConfiguration = context
-        .getRunContext()
-        .getConfiguration(RunnerConfiguration.class);
-      logFilteredIterations = runnerConfiguration.logFilteredIterations;
-      if (logFilteredIterations) {
-        stackTraceFilter = runnerConfiguration.filterStackTrace ? new StackTraceFilter(context.getSpec()) : new DummyStackTraceFilter();
-      }
     }
 
     @Override
@@ -307,60 +382,29 @@ public class DataIteratorFactory {
       }
       firstIteration = false;
 
-      while (true) {
-        // advances iterators and computes args
-        Object[] next = new Object[dataProviders.length];
-        for (int i = 0; i < dataProviders.length; ) {
-          try {
-            // if the filter block excluded an iteration
-            // this might be called after the last iteration
-            // so just return null if no further data is available
-            // to just cause the iteration to be skipped
-            if (!dataProviderIterators[i].hasNext()) {
-              return null;
-            }
-            Object[] nextValues = dataProviderIterators[i].next();
-            if (nextValues == null) {
-              return null;
-            }
-            System.arraycopy(nextValues, 0, next, i, nextValues.length);
-            i += nextValues.length;
-          } catch (Throwable t) {
-            supervisor.error(context.getErrorInfoCollector(), new ErrorInfo(context.getCurrentFeature().getDataProviders().get(i).getDataProviderMethod(), t, getErrorContext()));
+      // advances iterators and computes args
+      Object[] next = new Object[dataProviders.length];
+      for (int i = 0; i < dataProviders.length; ) {
+        try {
+          // if the filter block excluded an iteration
+          // this might be called after the last iteration
+          // so just return null if no further data is available
+          // to just cause the iteration to be skipped
+          if (!dataProviderIterators[i].hasNext()) {
             return null;
           }
-        }
-
-        MethodInfo filterMethod = context.getCurrentFeature().getFilterMethod();
-
-        if (filterMethod == null) {
-          return next;
-        }
-
-        try {
-          // do not use invokeRaw here, as that would report Assertion Error to the supervisor
-          filterMethod.invoke(null, next);
-          return next;
-        } catch (AssertionError ae) {
-          if (logFilteredIterations) {
-            StringJoiner stringJoiner = new StringJoiner(", ", "Filtered iteration [", "]:\n");
-            for (int i = 0; i < dataVariableNames.size(); i++) {
-              stringJoiner.add(dataVariableNames.get(i) + ": " + next[i]);
-            }
-            StringWriter sw = new StringWriter();
-            sw.write(stringJoiner.toString());
-            stackTraceFilter.filter(ae);
-            try (PrintWriter pw = new PrintWriter(sw)) {
-              ae.printStackTrace(pw);
-            }
-            System.err.println(sw);
+          Object[] nextValues = dataProviderIterators[i].next();
+          if (nextValues == null) {
+            return null;
           }
-          // filter block does not like these values, try next ones if available
+          System.arraycopy(nextValues, 0, next, i, nextValues.length);
+          i += nextValues.length;
         } catch (Throwable t) {
-          supervisor.error(context.getErrorInfoCollector(), new ErrorInfo(filterMethod, t, getErrorContext()));
+          supervisor.error(context.getErrorInfoCollector(), new ErrorInfo(context.getCurrentFeature().getDataProviders().get(i).getDataProviderMethod(), t, getErrorContext()));
           return null;
         }
       }
+      return next;
     }
 
     @Override
@@ -431,23 +475,31 @@ public class DataIteratorFactory {
         nextDataVariableMultiplication = null;
       }
 
+      List<DataProviderInfo> dataProviderInfos = context.getCurrentFeature().getDataProviders();
       List<IDataIterator> dataIterators = new ArrayList<>(dataProviders.length);
-      for (int i = 0; i < dataProviders.length; i++) {
-        String nextDataVariableName = dataVariableNames.get(i);
+      for (int dataProviderIndex = 0, dataVariableNameIndex = 0; dataProviderIndex < dataProviders.length; dataProviderIndex++, dataVariableNameIndex++) {
+        String nextDataVariableName = dataVariableNames.get(dataVariableNameIndex);
         if ((nextDataVariableMultiplication != null)
           && (nextDataVariableMultiplication.getDataVariables()[0].equals(nextDataVariableName))) {
 
           // a cross multiplication starts
-          dataIterators.add(createDataProviderMultiplier(nextDataVariableMultiplication, i));
-          // skip processed variables
-          i += nextDataVariableMultiplication.getDataVariables().length - 1;
+          dataIterators.add(createDataProviderMultiplier(nextDataVariableMultiplication, dataProviderIndex));
+          // skip processed providers and variables
+          int remainingVariables = nextDataVariableMultiplication.getDataVariables().length;
+          dataVariableNameIndex += remainingVariables - 1;
+          while (remainingVariables > 0) {
+            remainingVariables -= dataProviderInfos.get(dataProviderIndex).getDataVariables().size();
+            dataProviderIndex++;
+          }
+          dataProviderIndex--;
+          Assert.that(remainingVariables == 0);
           // wait for next cross multiplication
           nextDataVariableMultiplication = dataVariableMultiplications.hasNext() ? dataVariableMultiplications.next() : null;
         } else {
           // not a cross multiplication, just use a data provider iterator
           dataIterators.add(new DataProviderIterator(
             supervisor, context, nextDataVariableName,
-            context.getCurrentFeature().getDataProviders().get(i), dataProviders[i]));
+            dataProviderInfos.get(dataProviderIndex), dataProviders[dataProviderIndex]));
         }
       }
       return dataIterators.toArray(new IDataIterator[0]);
@@ -457,15 +509,12 @@ public class DataIteratorFactory {
      * Creates a multiplier that is backed by data providers and on-the-fly multiplies them as they are processed.
      *
      * @param dataVariableMultiplication the multiplication for which to create the multiplier
-     * @param i the index of the first data variable for the given multiplication
+     * @param dataProviderOffset the index of the first data provider for the given multiplication
      * @return the data provider multiplier
      */
-    private DataProviderMultiplier createDataProviderMultiplier(DataVariableMultiplication dataVariableMultiplication, int i) {
+    private DataProviderMultiplier createDataProviderMultiplier(DataVariableMultiplication dataVariableMultiplication, int dataProviderOffset) {
       DataVariableMultiplicationFactor multiplier = dataVariableMultiplication.getMultiplier();
       DataVariableMultiplicationFactor multiplicand = dataVariableMultiplication.getMultiplicand();
-
-      int multiplierDataVariablesLength = multiplier.getDataVariables().length;
-      int multiplicandDataVariablesLength = multiplicand.getDataVariables().length;
 
       if (multiplier instanceof DataVariableMultiplication) {
         // recursively dive into the multiplication depth-first
@@ -478,22 +527,15 @@ public class DataIteratorFactory {
         // here we first build the data provider multiplier for the multiplier
         // then we collect the data provider infos and data providers for the multiplicand
         // and then create the data provider multiplier for them
-        DataProviderMultiplier multiplierProvider = createDataProviderMultiplier((DataVariableMultiplication) multiplier, i);
+        DataProviderMultiplier multiplierProvider = createDataProviderMultiplier((DataVariableMultiplication) multiplier, dataProviderOffset);
         List<DataProviderInfo> multiplicandProviderInfos = new ArrayList<>();
-        Object[] multiplicandProviders = new Object[multiplicandDataVariablesLength];
-
-        List<DataProviderInfo> dataProviderInfos = context.getCurrentFeature().getDataProviders();
-        int j = multiplierDataVariablesLength;
-        int j2 = multiplierDataVariablesLength + multiplicandDataVariablesLength;
-        int k = 0;
-        for (; j < j2; j++, k++) {
-          multiplicandProviderInfos.add(dataProviderInfos.get(i + j));
-          multiplicandProviders[k] = dataProviders[i + j];
-        }
+        List<Object> multiplicandProviders = new ArrayList<>();
+        collectDataProviders(dataProviderOffset + multiplierProvider.getProcessedDataProviders(), multiplicand, multiplicandProviderInfos, multiplicandProviders);
 
         return new DataProviderMultiplier(supervisor, context,
           Arrays.asList(dataVariableMultiplication.getDataVariables()),
-          multiplicandProviderInfos, multiplierProvider, multiplicandProviders);
+          multiplicandProviderInfos, multiplierProvider,
+          multiplicandProviders.toArray(new Object[0]));
       } else {
         // this path handles the innermost multiplication (a * b)
         //
@@ -501,26 +543,32 @@ public class DataIteratorFactory {
         // and then creates a data provider multiplier for them
         List<DataProviderInfo> multiplierProviderInfos = new ArrayList<>();
         List<DataProviderInfo> multiplicandProviderInfos = new ArrayList<>();
-        Object[] multiplierProviders = new Object[multiplierDataVariablesLength];
-        Object[] multiplicandProviders = new Object[multiplicandDataVariablesLength];
-
-        List<DataProviderInfo> dataProviderInfos = context.getCurrentFeature().getDataProviders();
-        int j = 0;
-        int j2 = multiplierDataVariablesLength;
-        for (; j < j2; j++) {
-          multiplierProviderInfos.add(dataProviderInfos.get(i + j));
-          multiplierProviders[j] = dataProviders[i + j];
-        }
-        int k = 0;
-        for (j2 += multiplicandDataVariablesLength; j < j2; j++, k++) {
-          multiplicandProviderInfos.add(dataProviderInfos.get(i + j));
-          multiplicandProviders[k] = dataProviders[i + j];
-        }
+        List<Object> multiplierProviders = new ArrayList<>();
+        List<Object> multiplicandProviders = new ArrayList<>();
+        collectDataProviders(dataProviderOffset, multiplier, multiplierProviderInfos, multiplierProviders);
+        collectDataProviders(dataProviderOffset + multiplierProviderInfos.size(), multiplicand, multiplicandProviderInfos, multiplicandProviders);
 
         return new DataProviderMultiplier(supervisor, context,
           Arrays.asList(dataVariableMultiplication.getDataVariables()),
-          multiplierProviderInfos, multiplicandProviderInfos, multiplierProviders, multiplicandProviders);
+          multiplierProviderInfos, multiplicandProviderInfos,
+          multiplierProviders.toArray(new Object[0]),
+          multiplicandProviders.toArray(new Object[0]));
       }
+    }
+
+    private void collectDataProviders(int dataProviderOffset, DataVariableMultiplicationFactor factor,
+                                      List<DataProviderInfo> factorProviderInfos, List<Object> factorProviders) {
+      List<DataProviderInfo> dataProviderInfos = context.getCurrentFeature().getDataProviders();
+      int factorDataVariables = factor.getDataVariables().length;
+      int remainingDataVariables = factorDataVariables;
+      while (remainingDataVariables > 0) {
+        int dataProviderIndex = dataProviderOffset + factorDataVariables - remainingDataVariables;
+        DataProviderInfo dataProviderInfo = dataProviderInfos.get(dataProviderIndex);
+        factorProviderInfos.add(dataProviderInfo);
+        factorProviders.add(dataProviders[dataProviderIndex]);
+        remainingDataVariables -= dataProviderInfo.getDataVariables().size();
+      }
+      Assert.that(remainingDataVariables == 0);
     }
 
     @NotNull
@@ -667,7 +715,7 @@ public class DataIteratorFactory {
     /**
      * The data providers that are used as multiplicand
      * in this multiplication, if it represents in an
-     * {@code ((a * b) * c)} multiplication the {@code (ab * b)}
+     * {@code ((a * b) * c)} multiplication the {@code (ab * c)}
      * or the {@code (a * b)} part or otherwise {@code null}.
      * Outside the constructor it is only used for the final cleanup,
      */
@@ -723,6 +771,11 @@ public class DataIteratorFactory {
     private final int estimatedNumIterations;
 
     /**
+     * The amount how many data providers are processed by this data provider multiplier.
+     */
+    private final int processedDataProviders;
+
+    /**
      * Creates a new data provider multiplier that handles two sets of plain data providers as factors.
      * If the sizes of the providers in at least one of the sets can be estimated,
      * the factors of the multiplication are possibly swapped around to store as few values as possible
@@ -750,6 +803,8 @@ public class DataIteratorFactory {
         (estimatedMultiplierIterations == UNKNOWN_ITERATIONS) || (estimatedMultiplicandIterations == UNKNOWN_ITERATIONS)
           ? UNKNOWN_ITERATIONS
           : estimatedMultiplierIterations * estimatedMultiplicandIterations;
+
+      processedDataProviders = multiplierProviders.length + multiplicandProviders.length;
 
       if ((estimatedMultiplierIterations != UNKNOWN_ITERATIONS)
         && ((estimatedMultiplicandIterations == UNKNOWN_ITERATIONS) || (estimatedMultiplicandIterations > estimatedMultiplierIterations))) {
@@ -797,6 +852,8 @@ public class DataIteratorFactory {
         (estimatedMultiplierIterations == UNKNOWN_ITERATIONS) || (estimatedMultiplicandIterations == UNKNOWN_ITERATIONS)
           ? UNKNOWN_ITERATIONS
           : estimatedMultiplierIterations * estimatedMultiplicandIterations;
+
+      processedDataProviders = multiplierProvider.getProcessedDataProviders() + multiplicandProviders.length;
 
       if ((estimatedMultiplierIterations != UNKNOWN_ITERATIONS)
         && ((estimatedMultiplicandIterations == UNKNOWN_ITERATIONS) || (estimatedMultiplicandIterations > estimatedMultiplierIterations))) {
@@ -927,6 +984,15 @@ public class DataIteratorFactory {
     @Override
     public List<String> getDataVariableNames() {
       return dataVariableNames;
+    }
+
+    /**
+     * Returns how many data providers are processed by this data provider multiplier.
+     *
+     * @return how many data providers are processed by this data provider multiplier
+     */
+    public int getProcessedDataProviders() {
+      return processedDataProviders;
     }
 
     private Iterator<?>[] createIterators(Object[] dataProviders, List<DataProviderInfo> dataProviderInfos) {
